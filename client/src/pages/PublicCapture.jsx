@@ -1,333 +1,507 @@
-import React, { useState } from 'react'
+import React, { useState, useMemo } from 'react'
+import { useNavigate } from 'react-router-dom'
 import {
-  Building2,
-  Mail,
-  Phone,
-  DollarSign,
-  User,
-  FileText,
-  CheckCircle2,
   ArrowRight,
+  CheckCircle2,
   Loader2,
+  Building2,
+  UserCheck,
+  Sparkles,
 } from 'lucide-react'
+import { supabase } from '../lib/supabase'
 import { useCRM } from '../context/CRMContext'
 import { useToast } from '../context/ToastContext'
 
+const BUDGET_OPTIONS = [
+  { label: 'Under $5,000', value: 2500, points: 15 },
+  { label: '$5,000 - $15,000', value: 10000, points: 40 },
+  { label: '$15,000 - $50,000', value: 30000, points: 40 },
+  { label: '$50,000+', value: 60000, points: 40 },
+]
+
+const PERSONAL_DOMAINS = [
+  'gmail.com',
+  'yahoo.com',
+  'hotmail.com',
+  'outlook.com',
+  'icloud.com',
+  'aol.com',
+  'live.com',
+]
+
 export default function PublicCapture() {
-  const { capturePublicLead, calculateLeadScore, profiles } = useCRM()
-  const { addToast } = useToast()
+  const navigate = useNavigate()
+  const crm = useCRM() || {}
+  const { currentUser, user, profiles = [], refreshData } = crm
+  const toastCtx = useToast() || {}
+  const addToast = toastCtx.addToast || (() => { })
 
-  const [formData, setFormData] = useState({
-    fullName: '',
-    email: '',
-    phone: '',
-    companyName: '',
-    budget: '50000',
-    notes: '',
-  })
-
+  const [fullName, setFullName] = useState('')
+  const [companyName, setCompanyName] = useState('')
+  const [email, setEmail] = useState('')
+  const [phone, setPhone] = useState('')
+  const [budgetLabel, setBudgetLabel] = useState('$5,000 - $15,000')
+  const [notes, setNotes] = useState('')
   const [submitting, setSubmitting] = useState(false)
-  const [submittedData, setSubmittedData] = useState(null)
+  const [submittedLead, setSubmittedLead] = useState(null)
 
-  // Real-time calculation of preview score
-  const liveScore = calculateLeadScore({
-    email: formData.email,
-    phone: formData.phone,
-    budget: formData.budget,
-    companyName: formData.companyName,
-  })
+  const scoreBreakdown = useMemo(() => {
+    const cleanPhone = phone.replace(/\D/g, '')
+    const phonePoints = cleanPhone.length >= 7 ? 30 : 0
 
-  const handleChange = (e) => {
-    setFormData((prev) => ({ ...prev, [e.target.name]: e.target.value }))
+    const trimmedEmail = email.trim().toLowerCase()
+    let emailPoints = 0
+    if (trimmedEmail.includes('@') && trimmedEmail.split('@')[1]?.includes('.')) {
+      const domain = trimmedEmail.split('@')[1]
+      emailPoints = PERSONAL_DOMAINS.includes(domain) ? 10 : 30
+    }
+
+    const selectedBudget =
+      BUDGET_OPTIONS.find((b) => b.label === budgetLabel) || BUDGET_OPTIONS[1]
+    const budgetPoints = selectedBudget.points
+
+    const total = Math.min(100, phonePoints + emailPoints + budgetPoints)
+
+    return {
+      phonePoints,
+      emailPoints,
+      budgetPoints,
+      budgetValue: selectedBudget.value,
+      total,
+    }
+  }, [phone, email, budgetLabel])
+
+  const handleGoToWorkspace = async () => {
+    if (currentUser || user) {
+      navigate('/dashboard')
+      return
+    }
+
+    try {
+      const { data } = await supabase.auth.getSession()
+      if (data?.session) {
+        navigate('/dashboard')
+        return
+      }
+    } catch {
+      // Fallback to localStorage check below
+    }
+
+    const hasStoredUser = Object.keys(localStorage).some(
+      (key) =>
+        (key.includes('crm') || key.includes('sb-')) &&
+        localStorage.getItem(key) &&
+        localStorage.getItem(key) !== 'null'
+    )
+
+    navigate(hasStoredUser ? '/dashboard' : '/login')
   }
 
   const handleSubmit = async (e) => {
     e.preventDefault()
     if (submitting) return
     setSubmitting(true)
+
     try {
-      const res = await capturePublicLead(formData)
-      setSubmittedData(res)
-      addToast('Inquiry submitted! We have assigned a sales representative.')
+      const cleanName = fullName.trim()
+      const cleanCompany = companyName.trim()
+      const cleanEmail = email.trim()
+      const cleanPhone = phone.trim()
+      const cleanNotes = notes.trim()
+
+      // 1. Find or create matching Account
+      let accountId = null
+      const { data: existingAccounts } = await supabase
+        .from('accounts')
+        .select('id, company_name')
+        .ilike('company_name', cleanCompany)
+        .limit(1)
+
+      if (existingAccounts && existingAccounts.length > 0) {
+        accountId = existingAccounts[0].id
+      } else {
+        const { data: newAccount, error: accountError } = await supabase
+          .from('accounts')
+          .insert([{ company_name: cleanCompany }])
+          .select('id')
+          .single()
+
+        if (accountError) throw accountError
+        accountId = newAccount.id
+      }
+
+      // 2. Round-robin Sales Rep assignment
+      let availableReps = profiles.filter((p) => p.role === 'Sales Rep')
+      if (availableReps.length === 0) {
+        const { data: fetchedReps } = await supabase
+          .from('profiles')
+          .select('*')
+          .eq('role', 'Sales Rep')
+        availableReps = fetchedReps || []
+      }
+      if (availableReps.length === 0 && profiles.length > 0) {
+        availableReps = profiles
+      }
+
+      let assignedRep = null
+      if (availableReps.length > 0) {
+        const { count } = await supabase
+          .from('contacts')
+          .select('*', { count: 'exact', head: true })
+        const index = (count || 0) % availableReps.length
+        assignedRep = availableReps[index]
+      }
+
+      // 3. Insert new Lead into contacts
+      const { data: createdContact, error: contactError } = await supabase
+        .from('contacts')
+        .insert([
+          {
+            account_id: accountId,
+            name: cleanName,
+            email: cleanEmail,
+            phone: cleanPhone,
+            type: 'Lead',
+            stage: 'New',
+            score: scoreBreakdown.total,
+            deal_value: scoreBreakdown.budgetValue,
+            assigned_to: assignedRep?.id || null,
+          },
+        ])
+        .select('*')
+        .single()
+
+      if (contactError) throw contactError
+
+      // 4. Log Form Capture activity
+      const activityNotes = [
+        `Submitted inquiry via Public Lead Capture (${budgetLabel}).`,
+        cleanNotes ? `Notes: ${cleanNotes}` : null,
+      ]
+        .filter(Boolean)
+        .join(' ')
+
+      await supabase.from('activities').insert([
+        {
+          contact_id: createdContact.id,
+          user_id: assignedRep?.id || null,
+          type: 'Form Capture',
+          notes: activityNotes,
+        },
+      ])
+
+      // 5. Trigger Resend welcome email Edge Function (non-blocking fallback)
+      try {
+        await supabase.functions.invoke('send-email', {
+          body: {
+            to: cleanEmail,
+            subject: `We received your inquiry, ${cleanName}`,
+            html: `<p>Hi ${cleanName},</p><p>Thank you for reaching out to <strong>07 CRM</strong> regarding <strong>${cleanCompany}</strong>. ${assignedRep
+                ? `${assignedRep.full_name} has been assigned to your inquiry and will follow up shortly.`
+                : 'A member of our team will follow up shortly.'
+              }</p>`,
+          },
+        })
+      } catch {
+        // Graceful fallback if Resend Edge Function is not deployed yet
+      }
+
+      if (typeof refreshData === 'function') {
+        await refreshData()
+      }
+
+      setSubmittedLead({
+        name: cleanName,
+        company: cleanCompany,
+        score: scoreBreakdown.total,
+        repName: assignedRep?.full_name || 'Available Sales Rep',
+      })
+      addToast('Inquiry submitted successfully!', 'success')
     } catch (err) {
-      addToast(err.message || 'Error submitting lead.', 'error')
+      addToast(err?.message || 'Failed to submit inquiry. Please try again.', 'error')
     } finally {
       setSubmitting(false)
     }
   }
 
-  const assignedRep = profiles.find((p) => p.id === submittedData?.assignedRepId)
+  const handleReset = () => {
+    setFullName('')
+    setCompanyName('')
+    setEmail('')
+    setPhone('')
+    setBudgetLabel('$5,000 - $15,000')
+    setNotes('')
+    setSubmittedLead(null)
+  }
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col justify-between font-sans">
+    <div className="min-h-screen bg-slate-50 flex flex-col">
       {/* Top Navbar */}
-      <header className="border-b border-slate-200 bg-white px-6 py-3.5">
-        <div className="mx-auto max-w-4xl flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <div className="flex h-7 w-7 items-center justify-center rounded-md bg-indigo-600 text-white font-semibold text-xs">
+      <header className="bg-white border-b border-slate-200">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between">
+          <div className="flex items-center gap-2.5">
+            <div className="w-7 h-7 rounded-lg bg-indigo-600 text-white font-bold text-xs flex items-center justify-center">
               07
             </div>
-            <span className="font-semibold text-sm text-slate-900">07 CRM</span>
-            <span className="text-xs text-slate-400 ml-1.5 hidden sm:inline">Lead Capture</span>
+            <span className="text-sm font-bold text-slate-900 tracking-tight">
+              07 CRM
+            </span>
+            <span className="text-xs text-slate-400 font-medium">
+              Lead Capture
+            </span>
           </div>
 
-          <a
-            href="/dashboard"
-            className="h-8 inline-flex items-center gap-1.5 px-3 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700 shadow-xs"
+          <button
+            type="button"
+            onClick={handleGoToWorkspace}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700 transition-colors cursor-pointer"
           >
             <span>Workspace</span>
-            <ArrowRight className="h-3 w-3 text-slate-400" strokeWidth={1.75} />
-          </a>
+            <ArrowRight className="w-3.5 h-3.5 text-slate-400" />
+          </button>
         </div>
       </header>
 
-      {/* Hero & Form Section */}
-      <main className="flex-1 flex items-center justify-center px-4 py-8">
-        <div className="w-full max-w-3xl grid md:grid-cols-5 gap-6 items-start">
-          {/* Left Column */}
-          <div className="md:col-span-2 space-y-4 pt-1">
-            <div>
-              <h1 className="text-lg font-semibold text-slate-900">
-                Contact Sales
-              </h1>
-              <p className="mt-1 text-xs text-slate-500 leading-normal">
-                Submit project requirements. Inquiries are automatically scored and assigned to an available representative.
-              </p>
-            </div>
+      {/* Main Content */}
+      <main className="flex-1 max-w-4xl w-full mx-auto px-4 sm:px-6 py-10 sm:py-14">
+        <div className="grid grid-cols-1 md:grid-cols-12 gap-8 items-start">
+          {/* Left Column: Info + Live Lead Score Preview */}
+          <div className="md:col-span-5">
+            <h1 className="text-xl font-bold text-slate-900 tracking-tight">
+              Contact Sales
+            </h1>
+            <p className="mt-2 text-xs sm:text-sm text-slate-500 leading-relaxed">
+              Submit project requirements. Inquiries are automatically scored and
+              assigned to an available representative.
+            </p>
 
-            {/* Live Scoring Card Preview */}
-            <div className="rounded-lg border border-slate-200 bg-white p-3.5 shadow-xs">
-              <div className="flex items-center justify-between mb-1.5">
-                <span className="text-xs font-medium text-slate-700">
+            <div className="mt-6 bg-white rounded-xl border border-slate-200 p-4 shadow-sm">
+              <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+                <span className="text-xs font-semibold text-slate-700">
                   Lead Score Preview
                 </span>
-                <span
-                  className={`text-xs font-semibold px-1.5 py-0.5 rounded border tabular-nums ${
-                    liveScore >= 70
-                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                      : liveScore >= 40
-                      ? 'bg-amber-50 text-amber-700 border-amber-200'
-                      : 'bg-slate-100 text-slate-600 border-slate-200'
-                  }`}
-                >
-                  {liveScore} / 100
+                <span className="text-xs font-bold text-amber-600 tabular-nums">
+                  {scoreBreakdown.total} / 100
                 </span>
               </div>
 
-              {/* Progress bar */}
-              <div className="w-full bg-slate-100 h-1 rounded-full overflow-hidden mb-2.5">
-                <div
-                  className="bg-indigo-600 h-full transition-all duration-200"
-                  style={{ width: `${liveScore}%` }}
-                />
-              </div>
-
-              <div className="space-y-1 text-[11px] text-slate-500">
-                <div className="flex items-center justify-between">
+              <div className="mt-3 space-y-2 text-xs">
+                <div className="flex items-center justify-between text-slate-500">
                   <span>Phone (+30 pts)</span>
-                  <span className={formData.phone?.length >= 7 ? 'text-emerald-600 font-medium' : 'text-slate-400'}>
-                    {formData.phone?.length >= 7 ? '+30' : '0'}
+                  <span className="font-medium text-slate-700 tabular-nums">
+                    {scoreBreakdown.phonePoints > 0
+                      ? `+${scoreBreakdown.phonePoints}`
+                      : '0'}
                   </span>
                 </div>
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between text-slate-500">
                   <span>Work Email (+30 pts)</span>
-                  <span className={formData.email?.includes('@') && !formData.email?.includes('gmail') ? 'text-emerald-600 font-medium' : 'text-slate-400'}>
-                    {formData.email?.includes('@') && !formData.email?.includes('gmail') ? '+30' : '+10'}
+                  <span className="font-medium text-slate-700 tabular-nums">
+                    {scoreBreakdown.emailPoints > 0
+                      ? `+${scoreBreakdown.emailPoints}`
+                      : '0'}
                   </span>
                 </div>
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between text-slate-500">
                   <span>Budget Tier (+15 to +40 pts)</span>
-                  <span className={Number(formData.budget) >= 50000 ? 'text-emerald-600 font-medium' : 'text-slate-400'}>
-                    {Number(formData.budget) >= 50000 ? '+40' : Number(formData.budget) >= 15000 ? '+25' : '+15'}
+                  <span className="font-medium text-slate-700 tabular-nums">
+                    +{scoreBreakdown.budgetPoints}
                   </span>
                 </div>
               </div>
             </div>
           </div>
 
-          {/* Right Column: Form or Confirmation Screen */}
-          <div className="md:col-span-3">
-            {submittedData ? (
-              <div className="rounded-lg border border-slate-200 bg-white p-5 text-center space-y-4 shadow-xs">
-                <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-full bg-emerald-50 text-emerald-600">
-                  <CheckCircle2 className="h-6 w-6" strokeWidth={1.75} />
-                </div>
-
-                <div>
-                  <h3 className="text-sm font-semibold text-slate-900">Inquiry Submitted</h3>
-                  <p className="mt-0.5 text-xs text-slate-500">
-                    A record for <span className="font-medium text-slate-900">{submittedData.contact.name}</span> has been logged to the database.
+          {/* Right Column: Lead Details Form or Confirmation */}
+          <div className="md:col-span-7">
+            <div className="bg-white rounded-2xl border border-slate-200 p-6 sm:p-8 shadow-sm">
+              {submittedLead ? (
+                <div className="text-center py-4">
+                  <div className="w-11 h-11 rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center mx-auto">
+                    <CheckCircle2 className="w-6 h-6" />
+                  </div>
+                  <h2 className="mt-4 text-base font-bold text-slate-900">
+                    Inquiry Received
+                  </h2>
+                  <p className="mt-1 text-xs text-slate-500">
+                    Thank you, {submittedLead.name}. Your inquiry for{' '}
+                    <span className="font-medium text-slate-700">
+                      {submittedLead.company}
+                    </span>{' '}
+                    has been routed to our team.
                   </p>
-                </div>
 
-                <div className="rounded-md border border-slate-200 bg-slate-50 p-3 text-left space-y-2 text-xs">
-                  <div className="flex items-center justify-between border-b border-slate-200 pb-1.5">
-                    <span className="text-slate-500">Calculated Score</span>
-                    <span className="font-semibold text-emerald-600 tabular-nums">{submittedData.score} / 100</span>
-                  </div>
-                  <div className="flex items-center justify-between border-b border-slate-200 pb-1.5">
-                    <span className="text-slate-500">Assigned Representative</span>
-                    <span className="text-slate-900 font-medium">
-                      {assignedRep?.full_name || 'Sales Representative'}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between border-b border-slate-200 pb-1.5">
-                    <span className="text-slate-500">Company</span>
-                    <span className="text-slate-900">{formData.companyName}</span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-slate-500">Initial Stage</span>
-                    <span className="font-medium text-indigo-700">New (Lead)</span>
-                  </div>
-                </div>
-
-                <div className="flex flex-col sm:flex-row gap-2 pt-1">
-                  <button
-                    onClick={() => {
-                      setSubmittedData(null)
-                      setFormData({
-                        fullName: '',
-                        email: '',
-                        phone: '',
-                        companyName: '',
-                        budget: '50000',
-                        notes: '',
-                      })
-                    }}
-                    className="flex-1 h-9 px-3 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700"
-                  >
-                    Submit Another
-                  </button>
-                  <a
-                    href="/pipeline"
-                    className="flex-1 h-9 px-3 rounded-md bg-indigo-600 hover:bg-indigo-700 text-xs font-medium text-white flex items-center justify-center gap-1.5"
-                  >
-                    <span>View in Pipeline</span>
-                    <ArrowRight className="h-3 w-3" strokeWidth={1.75} />
-                  </a>
-                </div>
-              </div>
-            ) : (
-              <div className="rounded-lg border border-slate-200 bg-white p-5 shadow-xs">
-                <div className="mb-3">
-                  <h2 className="text-sm font-semibold text-slate-900">Lead Details</h2>
-                  <p className="text-[11px] text-slate-500">
-                    Provide contact details and project requirements below.
-                  </p>
-                </div>
-
-                <form onSubmit={handleSubmit} className="space-y-3">
-                  <div className="grid sm:grid-cols-2 gap-2.5">
-                    <div>
-                      <label className="block text-xs font-medium text-slate-700 mb-1">Full Name *</label>
-                      <input
-                        type="text"
-                        required
-                        name="fullName"
-                        placeholder="Alex Morgan"
-                        value={formData.fullName}
-                        onChange={handleChange}
-                        className="w-full h-9 rounded-md bg-white border border-slate-200 px-3 text-xs text-slate-900 placeholder-slate-400 focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 focus:outline-none"
-                      />
+                  <div className="mt-5 p-3.5 rounded-xl bg-slate-50 border border-slate-200 text-left space-y-2 text-xs">
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-500 inline-flex items-center gap-1.5">
+                        <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
+                        Calculated Lead Score
+                      </span>
+                      <span className="font-bold text-slate-900 tabular-nums">
+                        {submittedLead.score} / 100
+                      </span>
                     </div>
-
-                    <div>
-                      <label className="block text-xs font-medium text-slate-700 mb-1">Company Name *</label>
-                      <input
-                        type="text"
-                        required
-                        name="companyName"
-                        placeholder="Acme Inc."
-                        value={formData.companyName}
-                        onChange={handleChange}
-                        className="w-full h-9 rounded-md bg-white border border-slate-200 px-3 text-xs text-slate-900 placeholder-slate-400 focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 focus:outline-none"
-                      />
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-500 inline-flex items-center gap-1.5">
+                        <UserCheck className="w-3.5 h-3.5 text-indigo-600" />
+                        Assigned Representative
+                      </span>
+                      <span className="font-semibold text-slate-800">
+                        {submittedLead.repName}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-500 inline-flex items-center gap-1.5">
+                        <Building2 className="w-3.5 h-3.5 text-indigo-600" />
+                        Pipeline Stage
+                      </span>
+                      <span className="font-medium text-indigo-600">New</span>
                     </div>
                   </div>
 
-                  <div className="grid sm:grid-cols-2 gap-2.5">
-                    <div>
-                      <label className="block text-xs font-medium text-slate-700 mb-1">Work Email *</label>
-                      <input
-                        type="email"
-                        required
-                        name="email"
-                        placeholder="alex@acme.com"
-                        value={formData.email}
-                        onChange={handleChange}
-                        className="w-full h-9 rounded-md bg-white border border-slate-200 px-3 text-xs text-slate-900 placeholder-slate-400 focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 focus:outline-none"
-                      />
-                    </div>
-
-                    <div>
-                      <label className="block text-xs font-medium text-slate-700 mb-1">Phone Number *</label>
-                      <input
-                        type="tel"
-                        required
-                        name="phone"
-                        placeholder="+1 (555) 234-5678"
-                        value={formData.phone}
-                        onChange={handleChange}
-                        className="w-full h-9 rounded-md bg-white border border-slate-200 px-3 text-xs text-slate-900 placeholder-slate-400 focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 focus:outline-none"
-                      />
-                    </div>
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-medium text-slate-700 mb-1">
-                      Estimated Budget (USD)
-                    </label>
-                    <select
-                      name="budget"
-                      value={formData.budget}
-                      onChange={handleChange}
-                      className="w-full h-9 rounded-md bg-white border border-slate-200 px-2.5 text-xs text-slate-900 focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 focus:outline-none"
+                  <div className="mt-6 flex flex-col sm:flex-row gap-2.5">
+                    <button
+                      type="button"
+                      onClick={handleReset}
+                      className="flex-1 py-2.5 px-4 rounded-xl border border-slate-200 hover:bg-slate-50 text-xs font-medium text-slate-700 transition-colors cursor-pointer"
                     >
-                      <option value="10000">$5,000 - $15,000</option>
-                      <option value="35000">$15,000 - $50,000</option>
-                      <option value="75000">$50,000 - $100,000</option>
-                      <option value="150000">$100,000+</option>
-                    </select>
+                      Submit Another Inquiry
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleGoToWorkspace}
+                      className="flex-1 py-2.5 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium transition-colors inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <span>Back to Workspace</span>
+                      <ArrowRight className="w-3.5 h-3.5" />
+                    </button>
                   </div>
-
+                </div>
+              ) : (
+                <>
                   <div>
-                    <label className="block text-xs font-medium text-slate-700 mb-1">
-                      Notes
-                    </label>
-                    <textarea
-                      rows={3}
-                      name="notes"
-                      placeholder="Requirements or questions..."
-                      value={formData.notes}
-                      onChange={handleChange}
-                      className="w-full rounded-md bg-white border border-slate-200 p-2.5 text-xs text-slate-900 placeholder-slate-400 focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 focus:outline-none"
-                    />
+                    <h2 className="text-base font-bold text-slate-900">
+                      Lead Details
+                    </h2>
+                    <p className="mt-1 text-xs text-slate-500">
+                      Provide contact details and project requirements below.
+                    </p>
                   </div>
 
-                  <button
-                    type="submit"
-                    disabled={submitting}
-                    className="w-full h-9 rounded-md bg-indigo-600 hover:bg-indigo-700 text-xs font-medium text-white transition-colors disabled:opacity-50 inline-flex items-center justify-center gap-1.5"
-                  >
-                    {submitting ? (
-                      <>
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.75} />
-                        <span>Submitting Inquiry...</span>
-                      </>
-                    ) : (
-                      <span>Submit Inquiry</span>
-                    )}
-                  </button>
-                </form>
-              </div>
-            )}
+                  <form onSubmit={handleSubmit} className="mt-6 space-y-4">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                          Full Name *
+                        </label>
+                        <input
+                          type="text"
+                          required
+                          value={fullName}
+                          onChange={(e) => setFullName(e.target.value)}
+                          placeholder="Alex Morgan"
+                          className="w-full px-3 py-2 text-sm bg-white border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                          Company Name *
+                        </label>
+                        <input
+                          type="text"
+                          required
+                          value={companyName}
+                          onChange={(e) => setCompanyName(e.target.value)}
+                          placeholder="Acme Inc."
+                          className="w-full px-3 py-2 text-sm bg-white border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                          Work Email *
+                        </label>
+                        <input
+                          type="email"
+                          required
+                          value={email}
+                          onChange={(e) => setEmail(e.target.value)}
+                          placeholder="alex@acme.com"
+                          className="w-full px-3 py-2 text-sm bg-white border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                          Phone Number *
+                        </label>
+                        <input
+                          type="tel"
+                          required
+                          value={phone}
+                          onChange={(e) => setPhone(e.target.value)}
+                          placeholder="+1 (555) 234-5678"
+                          className="w-full px-3 py-2 text-sm bg-white border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                        Estimated Budget (USD)
+                      </label>
+                      <select
+                        value={budgetLabel}
+                        onChange={(e) => setBudgetLabel(e.target.value)}
+                        className="w-full px-3 py-2 text-sm bg-white border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+                      >
+                        {BUDGET_OPTIONS.map((option) => (
+                          <option key={option.label} value={option.label}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                        Notes
+                      </label>
+                      <textarea
+                        rows={3}
+                        value={notes}
+                        onChange={(e) => setNotes(e.target.value)}
+                        placeholder="Requirements or questions..."
+                        className="w-full px-3 py-2 text-sm bg-white border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 resize-y"
+                      />
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={submitting}
+                      className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-sm font-medium rounded-xl transition-colors flex items-center justify-center gap-2 cursor-pointer"
+                    >
+                      {submitting ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          <span>Submitting Inquiry...</span>
+                        </>
+                      ) : (
+                        <span>Submit Inquiry</span>
+                      )}
+                    </button>
+                  </form>
+                </>
+              )}
+            </div>
           </div>
         </div>
       </main>
 
       {/* Footer */}
-      <footer className="border-t border-slate-200 bg-white px-6 py-3 text-center text-xs text-slate-400">
-        07 CRM &copy; 2026.
+      <footer className="py-6 text-center text-xs text-slate-400">
+        07 CRM © 2026.
       </footer>
     </div>
   )
